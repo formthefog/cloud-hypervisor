@@ -23,9 +23,9 @@ pub struct UserData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub write_files: Option<Vec<WriteFile>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_cmd: Option<Vec<String>>,
+    pub runcmd: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub boot_cmd: Option<Vec<String>>,
+    pub bootcmd: Option<Vec<String>>,
 }
 
 impl UserData {
@@ -35,6 +35,8 @@ impl UserData {
                 hostname: "ubuntu-vm".to_string(),
                 users: Some(vec![User {
                     name: "ubuntu".to_string(),
+                    passwd: Some("$6$rounds=4096$Pm.pKkm3DJr/Wzkx$cHIPaq/JiKNA3da3Toif53Er3jCh.fdTp87zVHezIBN9SNqH0vxCoMCpihM0DY4BUmTQOnWJ1plT2wj0BSmg40".to_string()),
+                    lock_passwd: false,
                     sudo: Some("ALL=(ALL) NOPASSWD:ALL".to_string()),
                     groups: Some("sudo".to_string()),
                     shell: Some("/bin/bash".to_string()),
@@ -50,8 +52,8 @@ impl UserData {
                 package_upgrade: Some(true),
                 packages: None,
                 write_files: None,
-                run_cmd: None,
-                boot_cmd: None,
+                runcmd: None,
+                bootcmd: None,
             },
             // For now, use Ubuntu defaults for other distros
             // We can customize these later for each distro
@@ -61,7 +63,11 @@ impl UserData {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct User { pub name: String,
+pub struct User { 
+    pub name: String,
+    pub lock_passwd: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sudo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

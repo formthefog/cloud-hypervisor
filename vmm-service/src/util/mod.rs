@@ -1,11 +1,16 @@
 #![allow(unused)]
-use std::{io::Write, path::{Path, PathBuf}, process::Command};
+use std::{any::{Any, TypeId}, io::Write, path::{Path, PathBuf}, process::Command};
 use crate::Distro;
 use serde::Deserialize;
+use futures::stream::TryStreamExt;
+use rtnetlink::{new_connection, Handle, Error};
+use netlink_packet_route::link::nlas::InfoKind;
 
 pub const PREP_MOUNT_POINT: &str = "/mnt/cloudimg";
 pub const DEFAULT_NETPLAN_FILENAME: &str = "01-netplan-custom-config.yaml";
 pub const DEFAULT_NETPLAN: &str = "/var/lib/formation/netplan/01-custom-netplan.yaml";
+pub const DEFAULT_FORMNET_INSTALL: &str = "etc/systemd/system/formnet-install.service";
+pub const DEFAULT_FORMNET_UP: &str = "etc/systemd/system/formnet-up.service";
 pub const FORMNET_BINARY: &str = "/var/lib/formation/formnet/formnet";
 pub const BASE_DIRECTORY: &str  = "/var/lib/formation/vm-images";
 
@@ -37,6 +42,7 @@ struct BlockDevice {
 }
 
 pub fn ensure_directory<P: AsRef<Path>>(path: P) -> Result<(), UtilError> {
+    log::info!("ensuring directory {} exists", path.as_ref().display());
     if !path.as_ref().exists() {
         std::fs::create_dir_all(&path)?;
     }
@@ -99,6 +105,8 @@ fn convert_qcow2_to_raw(qcow2_path: &str, raw_path: &str) -> Result<(), UtilErro
 pub async fn fetch_and_prepare_images() -> Result<(), UtilError> {
     log::info!("Attempting to write base netplan");
     write_default_netplan()?;
+    write_default_formnet_install_service()?;
+    write_default_formnet_up_service()?;
     let base = PathBuf::from(BASE_DIRECTORY);
     let urls = [
         (UBUNTU, base.join("ubuntu/22.04/base.img")),
@@ -177,6 +185,8 @@ pub async fn fetch_and_prepare_images() -> Result<(), UtilError> {
     for img in base_imgs {
         let loop_device = get_image_loop_device(&img.display().to_string())?;
         let netplan_to = PathBuf::from(PREP_MOUNT_POINT).join("etc/netplan").join(DEFAULT_NETPLAN_FILENAME);
+        let formnet_install_to = PathBuf::from(PREP_MOUNT_POINT).join(DEFAULT_FORMNET_INSTALL);
+        let formnet_up_to = PathBuf::from(PREP_MOUNT_POINT).join(DEFAULT_FORMNET_UP);
         log::info!("Where to copy netplan config to: {}", netplan_to.display());
 
         mount_partition(
@@ -186,6 +196,16 @@ pub async fn fetch_and_prepare_images() -> Result<(), UtilError> {
         copy_default_netplan(
             &PathBuf::from(
                 netplan_to
+            )
+        )?;
+        copy_default_formnet_up_service(
+            &PathBuf::from(
+                formnet_up_to
+            )
+        )?;
+        copy_default_formnet_invite_service(
+            &PathBuf::from(
+                formnet_install_to
             )
         )?;
         copy_formnet_client(
@@ -230,6 +250,48 @@ pub fn copy_disk_image(
     Ok(())
 }
 
+fn copy_default_formnet_invite_service(to: impl AsRef<Path>) -> Result<(), UtilError> {
+    log::info!("Attempting to copy default formnet install service to {}", to.as_ref().display());
+    let parent = to.as_ref().parent().ok_or(
+        Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Unable to find parent of netplan directory"
+            )
+        )
+    )?;
+
+    std::fs::create_dir_all(&parent)?;
+    std::fs::copy(
+        DEFAULT_FORMNET_INSTALL,
+        &to
+    )?;
+
+    log::info!("Successfully copied default formnet install service to {}", to.as_ref().display());
+    Ok(())
+}
+
+fn copy_default_formnet_up_service(to: impl AsRef<Path>) -> Result<(), UtilError> {
+    log::info!("Attempting to copy default formnet up service to {}", to.as_ref().display());
+    let parent = to.as_ref().parent().ok_or(
+        Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Unable to find parent of netplan directory"
+            )
+        )
+    )?;
+
+    std::fs::create_dir_all(&parent)?;
+    std::fs::copy(
+        DEFAULT_FORMNET_UP,
+        &to
+    )?;
+
+    log::info!("Successfully copied default formnet up service to {}", to.as_ref().display());
+    Ok(())
+}
+
 fn copy_default_netplan(to: impl AsRef<Path>) -> Result<(), UtilError> {
     log::info!("Attempting to copy default netplan to {}", to.as_ref().display());
     let parent = to.as_ref().parent().ok_or(
@@ -249,6 +311,98 @@ fn copy_default_netplan(to: impl AsRef<Path>) -> Result<(), UtilError> {
 
     log::info!("Successfully copied default netplan to {}", to.as_ref().display());
 
+    Ok(())
+}
+
+fn write_default_formnet_install_service() -> Result<(), UtilError> {
+    let formnet_install_string = r#"[Unit]
+Description=Formnet Install
+After=network-online.target
+Wants=network-online.target
+
+# Only run if we haven't installed yet (optional safeguard)
+ConditionPathExists=!/etc/formnet/state.toml
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/formnet install --default-name -d /etc/formnet/invite.toml
+ExecStart=/bin/touch /etc/formnet/state.toml
+RemainAfterExit=yes
+StandardOutput=append:/var/log/formnet.log
+StandardError=append:/var/log/formnet.log
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
+    let formnet_install_service_path = PathBuf::from(DEFAULT_FORMNET_INSTALL);
+    let formnet_install_path = formnet_install_service_path.parent()
+        .ok_or(
+            Box::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "formnet install default path has no parent"
+                )
+            )
+        )?;
+
+    ensure_directory(formnet_install_path)?;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(DEFAULT_FORMNET_INSTALL)?;
+
+    file.write_all(formnet_install_string.as_bytes())?;
+
+    log::info!("Successfully wrote default formnet install to {}", DEFAULT_FORMNET_INSTALL);
+    Ok(())
+}
+
+fn write_default_formnet_up_service() -> Result<(), UtilError> {
+    log::info!("Attempting to write default formnet up service to {}", DEFAULT_FORMNET_UP);
+    let formnet_up_string = r#"[Unit]
+Description=Formnet Up
+After=formnet-install.service
+Wants=formnet-install.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/formnet up -d --interval 60
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/formnet.log
+StandardError=append:/var/log/formnet.log
+
+
+[Install]
+WantedBy=multi-user.target
+"#;
+    let formnet_up_service_path = PathBuf::from(DEFAULT_FORMNET_UP);
+    let formnet_up_path = formnet_up_service_path.parent()
+        .ok_or(
+            Box::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "formnet up default path has no parent"
+                )
+            )
+        )?;
+
+    ensure_directory(formnet_up_path)?;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(DEFAULT_FORMNET_UP)?;
+
+    file.write_all(formnet_up_string.as_bytes())?;
+
+    log::info!("Successfully wrote default formnet install to {}", DEFAULT_FORMNET_UP);
     Ok(())
 }
 
@@ -311,18 +465,34 @@ pub fn ensure_bridge_exists() -> Result<(), UtilError> {
 }
 
 
-pub fn add_tap_to_bridge(tap: &str) -> Result<brctl::Bridge, UtilError> {
-    let bridge = if let Some(bridge) = brctl::BridgeController::get_bridge("br0")? {
-        bridge
+pub async fn add_tap_to_bridge(bridge_name: &str, tap: &str) -> Result<(), UtilError> {
+        let (connection, handle, _) = new_connection()?;
+    tokio::spawn(connection);
+
+    // Get bridge index
+    let mut bridge_links = handle.link().get().match_name(bridge_name.to_string()).execute();
+    let bridge_index = if let Some(link) = bridge_links.try_next().await? {
+        link.header.index
     } else {
-        ensure_bridge_exists()?;
-        add_tap_to_bridge(tap)?
+        return Err(
+            Box::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Bridge {} not found", bridge_name)
+                )
+            )
+        )
     };
+    // Get interface index and add it to the bridge
+    let mut interface_links = handle.link().get().match_name(tap.to_string()).execute();
+    if let Some(link) = interface_links.try_next().await? {
+        handle.link().set(link.header.index)
+            .master(bridge_index)
+            .execute()
+            .await?;
+    }
 
-    bridge.add_interface(tap)?;
-
-    Ok(bridge)
-
+    Ok(())
 }
 
 fn get_image_loop_device(image_path: &str) -> Result<String, UtilError> {
@@ -486,4 +656,8 @@ pub fn try_convert_size_to_bytes(size: &str) -> Result<u128, UtilError> {
     };
 
     Ok(num_bytes)
+}
+
+pub fn is_unit_type<T: ?Sized + Any>() -> bool {
+    TypeId::of::<T>() == TypeId::of::<()>()
 }

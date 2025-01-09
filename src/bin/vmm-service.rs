@@ -4,7 +4,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{broadcast, mpsc};
 use form_types::VmmSubscriber;
 use form_types::VmmEvent;
-use vmm_service::{CliArgs, CliCommand}; 
+use vmm_service::{CliArgs, CliCommand, VmManager}; 
 use vmm_service::{
     VmmService,
     error::VmmError,
@@ -17,16 +17,13 @@ use vmm_service::util::fetch_and_prepare_images;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup the logger
-    println!("Starting the logger...");
     simple_logger::init_with_level(log::Level::Info)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
     log::info!("Attempting to fetch and prepare cloud images for VMs");
-
     // If we're unable to fetch and prepare the images we should panic and
     // exit the program.
     fetch_and_prepare_images().await.unwrap();
-
 
 
     // Parse command line args
@@ -34,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // TODO: Handle debug flag if set
     match args.command {
-        CliCommand::Run { config, sub_addr, pub_addr: _, wizard } => {
+        CliCommand::Run { config, wizard, .. } => {
             let config = if wizard {
                 info!("Running configuration wizard");
                 run_config_wizard()?
@@ -46,14 +43,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ServiceConfig::default()
             };
 
-            run_service_with_config(config, &sub_addr).await?;
+            let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1024);
+            let handle = tokio::task::spawn(async move {
+                if let Err(e) = run_vm_manager(config, shutdown_rx).await {
+                    log::error!("{e}");
+                }
+            });
+
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown_tx.send(())?;
+            handle.await?;
+
         }
         CliCommand::Configure {
             output,
             non_interactive,
             start,
-            sub_addr,
-            pub_addr: _
+            ..
         } => {
             // Create configuration
             let config = if non_interactive {
@@ -71,7 +77,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Start service if requested
             if start {
                 info!("Starting service with new configuration");
-                run_service_with_config(config, &sub_addr).await?;
             }
         }
 
@@ -85,7 +90,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn run_vm_manager(config: ServiceConfig, shutdown_rx: tokio::sync::broadcast::Receiver<()>) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let (event_sender, event_receiver) = tokio::sync::mpsc::channel(1024);
+    let api_addr = "0.0.0.0:3002".parse()?;
+    let formnet_endpoint = "http://127.0.0.1:3001/join".to_string();
+    let vm_manager = VmManager::new(
+        event_sender,
+        api_addr,
+        config,
+        formnet_endpoint
+    )?;
+
+    vm_manager.run(shutdown_rx, event_receiver).await 
+}
+
 // Helper function to run the service with a given configuration
+#[deprecated = "VmmService is deprecated"]
 async fn run_service_with_config(
     config: ServiceConfig,
     sub_addr: &str,
@@ -132,6 +152,7 @@ async fn run_service_with_config(
     Ok(())
 }
 
+#[deprecated = "VmmService is deprecated"]
 async fn run_service(
     service: &mut VmmService,
     mut shutdown_rx: broadcast::Receiver<()>,

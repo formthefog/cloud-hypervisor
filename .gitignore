@@ -12,3 +12,4 @@
 user-data
 meta-data
 create-cloud-init.sh
+/linux-cloud-hypervisor
