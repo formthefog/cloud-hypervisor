@@ -2048,54 +2048,69 @@ impl Vm {
 
     pub fn boot(&mut self) -> Result<()> {
         trace_scoped!("Vm::boot");
+        log::info!("Booting VM, checing current state");
         let current_state = self.get_state()?;
         if current_state == VmState::Paused {
+            log::info!("Vm State is paused... resuming...");
             return self.resume().map_err(Error::Resume);
         }
 
         let new_state = if self.stop_on_boot {
+            log::info!("New VM state is Breakpoint");
             VmState::BreakPoint
         } else {
+            log::info!("New VM state is Running");
             VmState::Running
         };
+        log::info!("Checking that new state is valid transition");
         current_state.valid_transition(new_state)?;
 
         // Do earlier to parallelise with loading kernel
         #[cfg(target_arch = "x86_64")]
         cfg_if::cfg_if! {
             if #[cfg(feature = "sev_snp")] {
+                log::info!("Checking that SEV SNP is enabled");
                 let sev_snp_enabled = self.config.lock().unwrap().is_sev_snp_enabled();
                 let rsdp_addr = if sev_snp_enabled {
+                    log::info!("SEV SNP is enabled, setting rsdp addr to None");
                     // In case of SEV-SNP guest ACPI tables are provided via
                     // IGVM. So skip the creation of ACPI tables and set the
                     // rsdp addr to None.
                     None
                 } else {
+                    log::info!("SEV SNP is not enabled, calling self.create_acpi_tables()");
                     self.create_acpi_tables()
                 };
             } else {
+                log::info!("SEV SNP is not configured, calling self.create_acpi_tables()");
                 let rsdp_addr = self.create_acpi_tables();
             }
         }
 
         // Load kernel synchronously or if asynchronous then wait for load to
         // finish.
+        log::info!("Getting entry point");
         let entry_point = self.entry_point()?;
 
         #[cfg(feature = "tdx")]
         let tdx_enabled = self.config.lock().unwrap().is_tdx_enabled();
 
         // Configure the vcpus that have been created
+        log::info!("Setting up vcpus");
         let vcpus = self.cpu_manager.lock().unwrap().vcpus();
         for vcpu in vcpus {
+            log::info!("Setting up guest memory");
             let guest_memory = &self.memory_manager.lock().as_ref().unwrap().guest_memory();
+            log::info!("mapping guest memory to entrypoint");
             let boot_setup = entry_point.map(|e| (e, guest_memory));
+            log::info!("Configuring cpus");
             self.cpu_manager
                 .lock()
                 .unwrap()
                 .configure_vcpu(vcpu, boot_setup)
                 .map_err(Error::CpuManager)?;
         }
+        log::info!("vcpus configured");
 
         #[cfg(feature = "tdx")]
         let (sections, guid_found) = if tdx_enabled {
@@ -2119,10 +2134,12 @@ impl Vm {
         let rsdp_addr = self.create_acpi_tables();
 
         // Configure shared state based on loaded kernel
+        log::info!("Configuring shared state based on loaded kernel");
         entry_point
             .map(|entry_point| {
                 // Safe to unwrap rsdp_addr as we know it can't be None when
                 // the entry_point is Some.
+                log::info!("Configuring system with rsdp addr and entrypoint");
                 self.configure_system(rsdp_addr.unwrap(), entry_point)
             })
             .transpose()?;
@@ -2133,6 +2150,7 @@ impl Vm {
         // userspace mappings to update the hypervisor about the memory mappings.
         // These mappings must be created before we start the vCPU threads for
         // the very first time.
+        log::info!("Allocating address space to memeory manager");
         self.memory_manager
             .lock()
             .unwrap()
@@ -2158,9 +2176,11 @@ impl Vm {
 
         // Resume the vm for MSHV
         if current_state == VmState::Created {
+            log::info!("Current state is Created, resuming");
             self.vm.resume().map_err(Error::ResumeVm)?;
         }
 
+        log::info!("booting vcpus");
         self.cpu_manager
             .lock()
             .unwrap()
@@ -2168,6 +2188,7 @@ impl Vm {
             .map_err(Error::CpuManager)?;
 
         let mut state = self.state.try_write().map_err(|_| Error::PoisonedState)?;
+        log::info!("Setting self.state to new state");
         *state = new_state;
         Ok(())
     }
@@ -2195,6 +2216,7 @@ impl Vm {
             .map_err(Error::CpuManager)?;
 
         event!("vm", "restored");
+
         Ok(())
     }
 

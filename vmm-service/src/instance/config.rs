@@ -36,7 +36,7 @@ impl Default for VmInstanceConfig {
             kernel_path: PathBuf::from("/var/lib/formation/kernel/hypervisor-fw"),
             rootfs_path: PathBuf::from("/var/lib/formation/vm-images/ubuntu/22.04/default/disk.raw"),
             tap_device: "vnet0".to_string(),
-            ip_addr: "10.99.0.44".to_string(),
+            ip_addr: "11.0.0.44".to_string(),
             cloud_init_path: None,
             memory_mb: 1024,
             vcpu_count: 2,

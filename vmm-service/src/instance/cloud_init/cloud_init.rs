@@ -39,10 +39,10 @@ impl CloudInit {
             UserData::default_from_distro(distro.clone())
         };
 
-        if let Some(ref mut runcmd) = user_data.run_cmd {
+        if let Some(ref mut runcmd) = user_data.runcmd {
             runcmd.extend(generate_default_runcmds())
         } else {
-            user_data.run_cmd = Some(generate_default_runcmds());
+            user_data.runcmd = Some(generate_default_runcmds());
         }
 
         if let Some(ref mut write_files) = user_data.write_files {
@@ -52,6 +52,14 @@ impl CloudInit {
                         format!("Unable to generate formnet invite file: {e}")
                     )
                 })?
+            );
+        } else {
+            user_data.write_files = Some(
+                vec![generate_invite_file(invitation).map_err(|e| {
+                    CloudInitError::FileWrite(
+                        format!("Unable to generate formnet invite file: {e}")
+                    )
+                })?]
             );
         }
 
@@ -88,7 +96,9 @@ impl CloudInit {
         // Write user-data
         let user_data_path = self.temp_dir.path().join("user-data");
         let user_data_yaml = serde_yaml::to_string(&self.user_data)?;
-        fs::write(user_data_path, user_data_yaml)?;
+        let final_output = format!("#cloud-config\n{user_data_yaml}");
+        log::info!("{final_output}");
+        fs::write(user_data_path, final_output)?;
 
         // Write meta-data
         let meta_data_path = self.temp_dir.path().join("meta-data");
@@ -175,6 +185,8 @@ impl Default for UserData {
             hostname: "default-vm".to_string(),
             users: Some(vec![User {
                 name: "ubuntu".to_string(),
+                passwd: Some("$6$rounds=4096$Pm.pKkm3DJr/Wzkx$cHIPaq/JiKNA3da3Toif53Er3jCh.fdTp87zVHezIBN9SNqH0vxCoMCpihM0DY4BUmTQOnWJ1plT2wj0BSmg40".to_string()),
+                lock_passwd: false,
                 sudo: Some("ALL=(ALL) NOPASSWD:ALL".to_string()),
                 groups: Some("sudo".to_string()),
                 shell: Some("/bin/bash".to_string()),
@@ -190,8 +202,8 @@ impl Default for UserData {
             package_upgrade: Some(true),
             packages: None,
             write_files: None,
-            run_cmd: None,
-            boot_cmd: None,
+            runcmd: None,
+            bootcmd: None,
         }
     }
 }

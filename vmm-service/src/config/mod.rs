@@ -67,9 +67,9 @@ pub fn create_vm_config(config: &VmInstanceConfig) -> VmConfig {
         ConsoleType::Serial => (
             ConsoleConfig {
                 file: None,
-                mode: ConsoleOutputMode::Tty,
+                mode: ConsoleOutputMode::Socket,
                 iommu: false,
-                socket: None,
+                socket: Some(PathBuf::from("/run/form-vm/test-vm-1-console.sock")), 
             },
             ConsoleConfig {
                 file: None,
@@ -81,15 +81,15 @@ pub fn create_vm_config(config: &VmInstanceConfig) -> VmConfig {
         ConsoleType::Virtio => (
             ConsoleConfig {
                 file: None,
-                mode: ConsoleOutputMode::Tty,
+                mode: ConsoleOutputMode::Socket,
                 iommu: false,
-                socket: None,
+                socket: Some(PathBuf::from("/run/form-vm/test-vm-1-console.sock")), 
             },
             ConsoleConfig {
                 file: None,
                 mode: ConsoleOutputMode::Null,
                 iommu: false,
-                socket: None,
+                socket: None
             },
         ),
     };
@@ -120,32 +120,16 @@ pub fn create_vm_config(config: &VmInstanceConfig) -> VmConfig {
         cpus: CpusConfig {
             boot_vcpus: config.vcpu_count,
             max_vcpus: config.vcpu_count,
-            topology: None,
-            kvm_hyperv: false,
-            max_phys_bits: 46,
-            affinity: None,
-            features: CpuFeatures {
-                amx: false,
-                ..CpuFeatures::default()
-            },
+            ..CpusConfig::default()
         },
         memory: MemoryConfig {
-            size: config.memory_mb * 1024 * 1024, // Convert MB to bytes
-            mergeable: false,
-            hotplug_method: vmm::vm_config::HotplugMethod::Acpi,
-            hotplug_size: None,
-            hotplugged_size: None,
-            shared: false,
-            hugepages: false,
-            hugepage_size: None,
-            prefault: false,
-            zones: None,
-            thp: true,
+            size: config.memory_mb << 20, // Convert MB to bytes
+            ..MemoryConfig::default()
         },
         payload: Some(PayloadConfig {
             kernel: Some(config.kernel_path.clone()),
             initramfs: None,
-            cmdline: None,
+            cmdline: None, 
             firmware: None,
         }),
         disks: Some(disks),

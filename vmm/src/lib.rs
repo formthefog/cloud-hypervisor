@@ -1270,11 +1270,16 @@ impl RequestHandler for Vmm {
     fn vm_create(&mut self, config: Box<VmConfig>) -> result::Result<(), VmError> {
         // We only store the passed VM config.
         // The VM will be created when being asked to boot it.
+        log::info!("Attempting to create VM");
         if self.vm_config.is_none() {
+            log::info!("VM Config doesn't exist yet");
             self.vm_config = Some(Arc::new(Mutex::new(*config)));
+            log::info!("saved VM confgig to self.vm_config");
+            log::info!("precreating console devices and saving to self.console_info");
             self.console_info =
                 Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
 
+            log::info!("Checking if landlock is enabled");
             if self
                 .vm_config
                 .as_ref()
@@ -1283,37 +1288,41 @@ impl RequestHandler for Vmm {
                 .unwrap()
                 .landlock_enable
             {
+                log::info!("Landlock is enabled, applying");
                 apply_landlock(self.vm_config.as_ref().unwrap().clone())
                     .map_err(VmError::ApplyLandlock)?;
             }
             Ok(())
         } else {
+            log::info!("Vm already exists returning error");
             Err(VmError::VmAlreadyCreated)
         }
     }
 
     fn vm_boot(&mut self) -> result::Result<(), VmError> {
+        log::info!("Attemting to boot VM");
         tracer::start();
         info!("Booting VM");
         event!("vm", "booting");
         let r = {
             trace_scoped!("vm_boot");
             // If we don't have a config, we cannot boot a VM.
-            println!("Checking that config is Some");
+            log::info!("Checking that config is Some");
             if self.vm_config.is_none() {
                 return Err(VmError::VmMissingConfig);
             };
 
             // console_info is set to None in vm_shutdown. re-populate here if empty
-            println!("Checking if console_info is set");
+            log::info!("Checking if console_info is set");
             if self.console_info.is_none() {
                 self.console_info =
                     Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
             }
 
             // Create a new VM if we don't have one yet.
-            println!("Checking if vm_info is some");
+            log::info!("Checking if vm is some");
             if self.vm.is_none() {
+                log::info!("vm is none, creating exit and reset events");
                 let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
                 let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
                 #[cfg(feature = "guest_debug")]
@@ -1321,13 +1330,15 @@ impl RequestHandler for Vmm {
                     .vm_debug_evt
                     .try_clone()
                     .map_err(VmError::EventFdClone)?;
+                log::info!("creating activate event");
                 let activate_evt = self
                     .activate_evt
                     .try_clone()
                     .map_err(VmError::EventFdClone)?;
 
+                log::info!("Checking that config exists");
                 if let Some(ref vm_config) = self.vm_config {
-                    println!("Creating new VM");
+                    log::info!("Config exists, building VM");
                     let vm = Vm::new(
                         Arc::clone(vm_config),
                         exit_evt,
@@ -1345,12 +1356,14 @@ impl RequestHandler for Vmm {
                         None,
                     )?;
 
+                    log::info!("saving vm to self.vm");
                     self.vm = Some(vm);
                 }
             }
 
             // Now we can boot the VM.
             if let Some(ref mut vm) = self.vm {
+                log::info!("Booting VM");
                 vm.boot()
             } else {
                 Err(VmError::VmNotCreated)

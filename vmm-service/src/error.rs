@@ -86,6 +86,9 @@ pub enum VmmError {
     NetworkError(String),
 }
 
+unsafe impl Send for VmmError {}
+unsafe impl Sync for VmmError {}
+
 // Instead of using #[from], we'll implement the From trait manually
 impl From<vmm::api::ApiError> for VmmError {
     fn from(error: vmm::api::ApiError) -> Self {

@@ -4,20 +4,60 @@ use axum::{
     Json,
     extract::State,
 };
-use serde::{Serialize, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::mpsc;
-use std::sync::Arc;
+use tokio::sync::Mutex;
+use vmm::api::VmmPingResponse;
+use std::{sync::Arc, time::Duration};
 use std::net::SocketAddr;
 
 use crate::VmmError;
 use form_types::VmmEvent;
 
+pub struct VmmApiChannel {
+    event_sender: mpsc::Sender<VmmEvent>,
+    response_receiver: mpsc::Receiver<String>
+}
+
+impl VmmApiChannel {
+    pub fn new(tx: mpsc::Sender<VmmEvent>, rx: mpsc::Receiver<String>) -> Self {
+        Self{
+            event_sender: tx,
+            response_receiver: rx
+        }
+    }
+
+    pub async fn send(&self, event: VmmEvent) -> Result<(), mpsc::error::SendError<VmmEvent>> {
+        self.event_sender.send(event).await
+    }
+
+    pub async fn recv<T: DeserializeOwned>(&mut self) -> Option<T> {
+        match self.response_receiver.recv().await {
+            Some(value) => {
+                match serde_json::from_str::<T>(&value) {
+                    Ok(resp) => return Some(resp),
+                    Err(e) => {
+                        log::error!("{e}");
+                        return None
+                    }
+                }
+            }
+            None => return None
+        }
+    }
+}
+
 /// API server that allows direct interaction with the VMM service
 pub struct VmmApi {
-    /// Channel to send events to the service
-    event_sender: mpsc::Sender<VmmEvent>,
+    /// Channels to send events to the service and receive responses
+    channel: Arc<Mutex<VmmApiChannel>>,
     /// Server address
     addr: SocketAddr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PingVmmRequest {
+    name: String,
 }
 
 /// Request to create a new VM instance
@@ -35,7 +75,7 @@ pub struct CreateVmRequest {
 }
 
 /// Response containing VM information
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct VmResponse {
     pub id: String,
     pub name: String,
@@ -43,15 +83,25 @@ pub struct VmResponse {
 }
 
 impl VmmApi {
-    pub fn new(event_sender: mpsc::Sender<VmmEvent>, addr: SocketAddr) -> Self {
+    pub fn new(
+        event_sender: mpsc::Sender<VmmEvent>,
+        response_receiver: mpsc::Receiver<String>,
+        addr: SocketAddr
+    ) -> Self {
+        let api_channel = Arc::new(Mutex::new(VmmApiChannel::new(
+            event_sender,
+            response_receiver
+        )));
         Self {
-            event_sender, addr
+            channel: api_channel, addr
         }
     }
 
     pub async fn start(&self) -> Result<(), VmmError> {
-        let app_state = Arc::new(self.event_sender.clone());
+        log::info!("Attempting to start API server");
+        let app_state = self.channel.clone();
 
+        log::info!("Establishing Routes");
         let app = Router::new()
             .route("/health", get(health_check))
             .route("/vm", post(create))
@@ -62,9 +112,11 @@ impl VmmApi {
             .route("/vms", get(list_vms))
             .with_state(app_state);
 
+        log::info!("Established route, binding to {}", &self.addr);
         let listener = tokio::net::TcpListener::bind(self.addr.clone()).await
             .map_err(|e| VmmError::SystemError(format!("Failed to bind listener to address {}: {e}", self.addr.clone())))?;
         // Start the API server
+        log::info!("Starting server");
         axum::serve(listener, app).await
             .map_err(|e| VmmError::SystemError(format!("Failed to serve API server {e}")))?;
 
@@ -82,7 +134,7 @@ async fn health_check() -> &'static str {
 }
 
 async fn create(
-    State(sender): State<Arc<mpsc::Sender<VmmEvent>>>,
+    State(channel): State<Arc<Mutex<VmmApiChannel>>>,
     Json(request): Json<CreateVmRequest>,
 ) -> Result<Json<VmResponse>, String> {
     log::info!(
@@ -108,7 +160,7 @@ async fn create(
 
     log::info!("Sending create event to VMM service: {:?}", event);
 
-    sender.send(event).await.map_err(|e| e.to_string())?;
+    channel.lock().await.send(event).await.map_err(|e| e.to_string())?;
 
     log::info!("VM Creation request processed for {}", request.name);
 
@@ -119,6 +171,24 @@ async fn create(
     }))
 
 }
+
+async fn ping(
+    State(channel): State<Arc<Mutex<VmmApiChannel>>>,
+    Json(request): Json<PingVmmRequest>
+) -> Result<Json<VmmPingResponse>, String> {
+    let event = VmmEvent::Ping { name: request.name.to_string() };
+    let mut channel = channel.lock().await; 
+    channel.send(event).await.map_err(|e| e.to_string())?;
+    tokio::select! {
+        Some(resp) = channel.recv() => {
+            Ok(Json(resp))
+        }
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {
+            Err("Ping request timed out awaiting response".to_string())
+        }
+    }
+}
+
 async fn start_vm() {}
 async fn stop_vm() {}
 async fn delete_vm() {}

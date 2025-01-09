@@ -1,13 +1,13 @@
 // src/service/vmm.rs
-use std::{collections::HashMap, net::IpAddr};
-use std::net::{Ipv4Addr, SocketAddr};
-use formnet::{JoinRequest, VmJoinRequest};
+use std::{collections::HashMap, path::PathBuf};
+use std::net::SocketAddr;
+use formnet::{JoinRequest, JoinResponse, VmJoinRequest};
 use http_body_util::{BodyExt, Full};
+use hyper::StatusCode;
 use hyper::{body::{Bytes, Incoming},  Method, Request, Response};
 use hyper_util::client::legacy::Client;
 use hyperlocal::{UnixConnector, UnixClientExt, Uri};
-use reqwest::Method;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, Deserialize, de::DeserializeOwned};
 use shared::interface_config::InterfaceConfig;
 use tokio::net::TcpListener;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use seccompiler::SeccompAction;
 use tokio::task::JoinHandle;
 use tokio::sync::Mutex;
 use form_types::{FormnetMessage, FormnetTopic, GenericPublisher, PeerType, VmmEvent};
-use crate::api::VmmApi;
+use crate::{api::VmmApi, util::ensure_directory};
 use crate::util::add_tap_to_bridge;
 use crate::ChError;
 use crate::VmRuntime;
@@ -37,8 +37,23 @@ use crate::{
     ServiceConfig,
 };
 
-type VmmResult = Result<(), Box<dyn std::error::Error>>;
-type ApiResult<T> = Result<T, Box<dyn std::error::Error>>; 
+type VmmResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
+type ApiResult<T> = Result<ApiResponse<T>, Box<dyn std::error::Error + Send + Sync + 'static>>; 
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ApiResponse<T> {
+    SuccessNoContent {
+        code: String, 
+    },
+    Success {
+        code: String,
+        content: Option<T>
+    },
+    Error {
+        code: String,
+        reason: String,
+    }
+}
 
 pub struct FormVmm {
     socket_path: String,
@@ -58,13 +73,13 @@ impl FormVmm {
         &self.socket_path
     }
     
-    pub async fn join(&mut self) -> VmmResult {
+    pub async fn join(&mut self) -> VmmResult<()> {
         let handle = self.thread.take();
         if let Some(h) = handle {
             let _ = h.thread_handle
                 .join()
-                .map_err(ChError::ThreadJoin)?
-                .map_err(ChError::VmmThread)?;
+                .map_err(|_| Box::new(VmmError::SystemError(format!("Error trying to join vmm thread in FormVmm::join"))))?
+                .map_err(|_| Box::new(VmmError::SystemError(format!("Error trying to join vmm thread in FormVmm::join"))))?;
             self.thread = None;
         }
 
@@ -95,8 +110,19 @@ impl FormVmApi {
     }
 
     pub async fn create(&self, config: &VmInstanceConfig) -> ApiResult<()> {
-        let json_body = serde_json::to_string(&create_vm_config(config))?;
-        self.body_request("vm.create", json_body).await
+        let json_body = serde_json::to_string(
+            &create_vm_config(config)
+        ).map_err(|e| {
+            Box::new(VmmError::OperationFailed(
+                format!("vm.create faield to convert body of request to json: {e}")
+            ))
+        })?;
+        Ok(self.body_request("vm.create", json_body).await.map_err(|e| {
+            Box::new(VmmError::OperationFailed(
+                format!("vm.create failed to send request succesfully: {e}")
+            ))
+        })?)
+
     }
 
     pub async fn boot(&self) -> ApiResult<()> {
@@ -216,6 +242,7 @@ impl FormVmApi {
     }
 
     async fn build_uri(&self, endpoint: &str) -> hyper::http::Uri {
+        log::info!("Building URI...");
         Uri::new(
             self.socket_path.clone(), 
             &format!("{}/{}", Self::URI_BASE, endpoint)
@@ -235,8 +262,39 @@ impl FormVmApi {
             .header("Content-Type", "application/json")
             .body(Full::new(Bytes::from("")))?;
 
-        let mut response = self.client.request(request).await?;
-        self.recv::<T>(&mut response).await
+        let mut response = self.client.request(request).await.map_err(|e| {
+            Box::new(
+                VmmError::OperationFailed(
+                    format!("calling {endpoint} failed on call to self.client.request(reuqest) in `body_request` function: {e}")
+                )
+            )
+        })?;
+
+        log::info!("{response:?}");
+
+        let status = response.status();
+
+        log::info!("{status}");
+        
+        if status == StatusCode::NO_CONTENT {
+            return Ok(ApiResponse::SuccessNoContent { code: status.to_string() })
+        }
+
+        if response.status().is_success() {
+            return Ok(self.recv::<T>(&mut response).await.map_err(|e| {
+                Box::new(VmmError::OperationFailed(
+                        format!("calling {endpoint} failed: {e}, received response {}", response.status())
+                ))
+            })?)
+        }
+        return Err(
+                Box::new(
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Received non-success status code from api calling {endpoint}")
+                    )
+                )
+            )
     }
 
     async fn body_request<T: DeserializeOwned>(&self, endpoint: &str, body: String) -> ApiResult<T> {
@@ -247,8 +305,39 @@ impl FormVmApi {
             .header("Content-Type", "application/json")
             .body(Full::new(Bytes::from(body)))?;
 
-        let mut response = self.client.request(request).await?;
-        self.recv::<T>(&mut response).await
+        let mut response = self.client.request(request).await.map_err(|e| {
+            Box::new(
+                VmmError::OperationFailed(
+                    format!("calling {endpoint} failed on call to self.client.request(reuqest) in `body_request` function: {e}")
+                )
+            )
+        })?;
+
+        log::info!("{response:?}");
+
+        let status = response.status();
+
+        log::info!("{status}");
+        
+        if status == StatusCode::NO_CONTENT {
+            return Ok(ApiResponse::SuccessNoContent { code: status.to_string() })
+        }
+
+        if response.status().is_success() {
+            return Ok(self.recv::<T>(&mut response).await.map_err(|e| {
+                Box::new(VmmError::OperationFailed(
+                        format!("calling {endpoint} failed: {e}, received response {}", response.status())
+                ))
+            })?)
+        }
+        return Err(
+                Box::new(
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Received non-success status code from api calling {endpoint}")
+                    )
+                )
+            )
     }
 
     async fn recv<T: DeserializeOwned>(&self, resp: &mut Response<Incoming>) -> ApiResult<T> {
@@ -261,7 +350,18 @@ impl FormVmApi {
             }
         }
 
-        Ok(serde_json::from_slice::<T>(&segments)?)
+        Ok(ApiResponse::Success {
+            code: resp.status().to_string(),
+            content: Some(
+                serde_json::from_slice::<T>(&segments).map_err(|e| {
+                    Box::new(
+                        VmmError::OperationFailed(
+                            format!("unable to acquire response successuflly in recv() call: {e}")
+                        )
+                    )
+                })?
+            )
+        })
     }
 }
 
@@ -269,9 +369,10 @@ pub struct VmManager {
     // We need to stash threads & socket paths
     config: ServiceConfig,
     vm_monitors: HashMap<String, FormVmm>, 
-    server: VmmApi,
+    server: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>>,
     tap_counter: u32,
     formnet_endpoint: String,
+    api_response_sender: tokio::sync::mpsc::Sender<String>
     // Add subscriber to message broker
 }
 
@@ -281,36 +382,72 @@ impl VmManager {
         addr: SocketAddr,
         config: ServiceConfig,
         formnet_endpoint: String,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(1024);
+        let server = tokio::task::spawn(async move {
+            let server = VmmApi::new(event_sender, resp_rx, addr);
+            server.start().await?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync + 'static>>(())
+        });
         Ok(Self {
             config,
             vm_monitors: HashMap::new(),
-            server: VmmApi::new(event_sender, addr),
+            server, 
             tap_counter: 0,
-            formnet_endpoint
+            formnet_endpoint,
+            api_response_sender: resp_tx 
         })
     }
 
     pub async fn create(
         &mut self,
         config: &VmInstanceConfig
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        log::info!("Received create request to create vm instance {}...", config.name);
         let (api_socket_path, api_socket_fd) = if let Ok(path) = std::env::var("XDG_RUNTIME_DIR") {
+            let sock_path = format!("{path}/form-vmm/{}.sock", config.name);
+            ensure_directory(
+                PathBuf::from(&sock_path).parent().ok_or(
+                    Box::new(
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Parent directory for {sock_path} not found")
+                        )
+                    )
+                )?
+            )?;
             (Some(format!("{path}/form-vm/{}.sock", config.name)), None)
         } else {
+            let sock_path = format!("run/form-vmm/{}.sock", config.name);
+            ensure_directory(
+                PathBuf::from(&sock_path).parent().ok_or(
+                    Box::new(
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Parent directory for {sock_path} not found")
+                        )
+                    )
+                )?
+            )?;
             (Some(format!("/run/form-vm/{}.sock", config.name)), None) 
         };
+        log::info!("Established API Socket for vm instance {}: {:?}...", config.name, api_socket_path);
 
         // Create channels and EventFDs
         let (api_request_sender, api_request_receiver) = std::sync::mpsc::channel();
+        log::info!("Created Api Request channel");
 
-        let api_evt = EventFd::new(EFD_NONBLOCK).map_err(ChError::CreateApiEventFd)?;
+        let api_evt = EventFd::new(EFD_NONBLOCK).map_err(ChError::CreateApiEventFd).map_err(|e| {
+            Box::new(VmmError::Config(format!("Unable to acquire EventFd: {e}")))
+        })?;
 
+        log::info!("Created api event EventFd");
         // Signal handling
         unsafe {
             libc::signal(libc::SIGCHLD, libc::SIG_IGN);
         }
 
+        log::info!("Set up signal handling");
         for sig in &vmm::vm::Vm::HANDLED_SIGNALS {
             let _ = block_signal(*sig).map_err(|e| eprintln!("Error blocking signals: {e}"));
         }
@@ -319,11 +456,21 @@ impl VmManager {
             let _ = block_signal(*sig).map_err(|e| eprintln!("Error blocking signals: {e}"));
         }
 
+        log::info!("Handled signals");
         // Initialize hypervisor
-        let hypervisor = hypervisor::new().map_err(ChError::CreateHypervisor)?;
-        let exit_evt = EventFd::new(EFD_NONBLOCK).map_err(ChError::CreateExitEventFd)?;
+        let hypervisor = hypervisor::new().map_err(|e| Box::new(VmmError::SystemError(
+            format!("Unable to create hypervisor: {e}")
+        )))?;
+        log::info!("Createed new hypervisor");
+        let exit_evt = EventFd::new(EFD_NONBLOCK).map_err(|e| {
+            Box::new(VmmError::Config(
+                format!("Unable to create EventFd: {e}")
+            ))
+        })?;
 
+        log::info!("Created new exit event EventFd");
         // Start the VMM thread
+        log::info!("Attempting to start vmm thread");
         let vmm_thread_handle = vmm::start_vmm_thread(
             vmm::VmmVersionInfo::new(env!("BUILD_VERSION"), env!("CARGO_PKG_VERSION")),
             &api_socket_path,
@@ -336,51 +483,95 @@ impl VmManager {
             hypervisor,
             false,
         )
-        .map_err(ChError::StartVmmThread)?;
+        .map_err(|e| {
+            Box::new(
+                VmmError::SystemError(
+                    format!("Unable to start vmm thread:{e}")
+                )
+            )
+        })?;
+        log::info!("Started VMM Thread");
 
         // At this point api_socket_path is always Some
         // we can safely unwrap
+        log::info!("Creating new FormVmm");
         let vmm = FormVmm::new(
             &api_socket_path.unwrap(),
             vmm_thread_handle
         );
 
-        vmm.api.create(config).await?;
+        log::info!("Created new FormVmm");
+        log::info!("Calling `create` on FormVmm");
+        vmm.api.create(config).await.map_err(|e| {
+            Box::new(
+                VmmError::OperationFailed(
+                    format!("vmm.api.create(config) failed: {e}") 
+                )
+            )
+        })?;
+
+        log::info!("Inserting Form VMM into vm_monitoris map");
         self.vm_monitors.insert(config.name.clone(), vmm);
-        self.boot(config.name.clone());
+        log::info!("Calling `boot` on FormVmm");
+        self.boot(config.name.clone()).await?;
+
+        if let Err(e) = add_tap_to_bridge("br0", &config.tap_device.clone()).await {
+            log::error!("Error attempting to add tap device {} to bridge: {e}", &config.tap_device)
+        };
+
 
         Ok(())
     }
 
-    pub async fn boot(&mut self, name: String) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn boot(&mut self, name: String) -> ApiResult<()> {
         self.get_vmm(&name)?.api.boot().await
     }
     
-    pub async fn ping(&self, name: String) -> Result<VmmPingResponse, Box<dyn std::error::Error>> {
+    pub async fn ping(&self, name: String) -> ApiResult<VmmPingResponse> {
         self.get_vmm(&name)?.api.ping().await
     }
 
-    pub async fn shutdown(&self, name: String) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn shutdown(&self, name: String) -> ApiResult<()> {
         self.get_vmm(&name)?.api.shutdown().await
     }
 
-    pub async fn pause(&self, name: String) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn pause(&self, name: String) -> ApiResult<()> {
         self.get_vmm(&name)?.api.pause().await
     }
 
-    pub async fn resume(&self, name: String) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn resume(&self, name: String) -> ApiResult<()> {
         self.get_vmm(&name)?.api.resume().await
     }
 
-    pub async fn reboot(&self, name: String) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn reboot(&self, name: String) -> ApiResult<()> {
         self.get_vmm(&name)?.api.reboot().await
     }
 
-    pub async fn delete(&self, name: String) -> Result<(), Box<dyn std::error::Error>> {
-        self.get_vmm(&name)?.api.delete().await
+    pub async fn delete(&mut self, name: String) -> ApiResult<()> {
+        let api = &self.get_vmm(&name)?.api;
+        let resp = api.delete().await?;
+        match &resp {
+            ApiResponse::SuccessNoContent { .. } => {
+                std::fs::remove_file(&api.socket_path)?;
+                self.remove_vmm(&name)?;
+                return Ok(resp.clone())
+            }
+            ApiResponse::Error { .. } => {
+                return Ok(resp.clone())
+            }
+            ApiResponse::Success { code, content } => {
+                return Err(
+                    Box::new(
+                        VmmError::OperationFailed(
+                            format!("Received invalid response from `vm.delete` endpoint: {code:?} {content:?}")
+                        )
+                    )
+                )
+            }
+        }
     }
 
-    pub async fn power_button(&self, name: &String) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn power_button(&self, name: &String) -> ApiResult<()> {
         self.get_vmm(&name)?.api.power_button().await
     }
 
@@ -388,12 +579,14 @@ impl VmManager {
         mut self,
         mut shutdown_rx: broadcast::Receiver<()>,
         mut api_rx: mpsc::Receiver<VmmEvent>
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         loop {
             tokio::select! {
-                _ =  self.server.start() => {
-                }
-                _ = shutdown_rx.recv() => {
+                res = shutdown_rx.recv() => {
+                    match res {
+                        Ok(()) => log::warn!("Received shutdown signal, shutting VmManager down"),
+                        Err(e) => log::error!("Received error from shutdown signal: {e}")
+                    }
                     break;
                 }
                 Some(event) = api_rx.recv() => {
@@ -405,8 +598,14 @@ impl VmManager {
         Ok(())
     }
 
-    async fn handle_vmm_event(&mut self, event: VmmEvent) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_vmm_event(&mut self, event: VmmEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         match event {
+            VmmEvent::Ping { name } => {
+                let resp = self.ping(name).await?;
+                self.api_response_sender.send(
+                    serde_json::to_string(&resp)?
+                ).await?;
+            }
             VmmEvent::Create { 
                 ref name, 
                 ..
@@ -420,6 +619,7 @@ impl VmManager {
 
                 log::info!("Built VmInstanceConfig... Adding TAP device name");
                 instance_config.tap_device = format!("vmnet{}", self.tap_counter);
+                instance_config.ip_addr = format!("11.0.0.{}", self.tap_counter + 2);
                 log::info!("Added TAP device name... Incrementing TAP counter...");
                 self.tap_counter += 1;
                 log::info!("Incremented TAP counter... Attempting to create VM");
@@ -446,22 +646,28 @@ impl VmManager {
     }
 
     async fn request_formnet_invite_for_vm_via_api(&self, name: &str) -> Result<InterfaceConfig, VmmError> {
+        log::info!("Requesting formnet invite for vm {name}");
+        log::info!("Building VmJoinRequest");
         let join_request = VmJoinRequest { vm_id: name.to_string() };
+        log::info!("Wrapping VmJoinRequest in a JoinRequest");
         let join_request = JoinRequest::InstanceJoinRequest(join_request);
+        log::info!("Getting a new client");
         let client = reqwest::Client::new();
-        let resp = client.post(self.formnet_endpoint.clone())
-            .json(
-                &serde_json::to_string(&join_request).map_err(|e| {
-                    VmmError::NetworkError(e.to_string())
-                })?
-            )
+        log::info!("Posting request to endpoint using client, awaiting response...");
+        let resp = client.post(&format!("http://{}/join", self.formnet_endpoint.clone()))
+            .json(&join_request)
             .send().await.map_err(|e| {
                 VmmError::NetworkError(e.to_string())
-            })?.json::<InterfaceConfig>().await.map_err(|e| {
+            })?.json::<JoinResponse>().await.map_err(|e| {
                 VmmError::NetworkError(e.to_string())
             })?;
 
-        Ok(resp)
+        log::info!("Response text: {resp:?}");
+
+        match resp {
+            JoinResponse::Success { invitation } => return Ok(invitation),
+            JoinResponse::Error(reason) => return Err(VmmError::NetworkError(reason.clone()))
+        }
     }
 
     async fn request_formnet_invite_for_vm_via_broker(
@@ -514,12 +720,17 @@ impl VmManager {
         }
     }
 
-    fn get_vmm(&self, name: &str) -> Result<&FormVmm, Box<dyn std::error::Error>> {
+    fn get_vmm(&self, name: &str) -> VmmResult<&FormVmm> {
         Ok(self.vm_monitors.get(name).ok_or(
             VmmError::VmNotFound(
                 format!("Unable to find Vm Monitor for {name}")
             )
         )?)
+    }
+
+    fn remove_vmm(&mut self, name: &str) -> VmmResult<()> {
+        self.vm_monitors.remove(name);
+        Ok(())
     }
 }
 
@@ -550,12 +761,14 @@ impl VmmService {
             .map_err(|e| VmmError::SystemError(format!("Failed to create exit eventfd: {}", e)))?;
 
         let (shutdown_sender, _) = broadcast::channel(1);
+        let (_api_tx, api_rx) = mpsc::channel(1024);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], 3002));
 
         let vmm_api = VmmApi::new(
             event_sender,
-            addr
+            api_rx,
+            addr,
         );
 
         Ok(Self {
@@ -714,7 +927,7 @@ impl VmmService {
             log::info!("Sent VmBoot event to API sender");
 
             log::info!("Adding TAP device to bridge interface");
-            if let Err(e) = add_tap_to_bridge(&config.tap_device.clone()) {
+            if let Err(e) = add_tap_to_bridge("br0", &config.tap_device.clone()).await {
                 log::error!("Error attempting to add tap device {} to bridge: {e}", &config.tap_device)
             };
 
