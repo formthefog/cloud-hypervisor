@@ -9,8 +9,8 @@ use netlink_packet_route::link::nlas::InfoKind;
 pub const PREP_MOUNT_POINT: &str = "/mnt/cloudimg";
 pub const DEFAULT_NETPLAN_FILENAME: &str = "01-netplan-custom-config.yaml";
 pub const DEFAULT_NETPLAN: &str = "/var/lib/formation/netplan/01-custom-netplan.yaml";
-pub const DEFAULT_FORMNET_INSTALL: &str = "/var/lib/formation/formnet/formnet-install.service";
-pub const DEFAULT_FORMNET_UP: &str = "/var/lib/formation/formnet/formnet-up.service";
+pub const DEFAULT_FORMNET_INSTALL: &str = "etc/systemd/system/formnet-install.service";
+pub const DEFAULT_FORMNET_UP: &str = "etc/systemd/system/formnet-up.service";
 pub const FORMNET_BINARY: &str = "/var/lib/formation/formnet/formnet";
 pub const BASE_DIRECTORY: &str  = "/var/lib/formation/vm-images";
 
@@ -185,6 +185,8 @@ pub async fn fetch_and_prepare_images() -> Result<(), UtilError> {
     for img in base_imgs {
         let loop_device = get_image_loop_device(&img.display().to_string())?;
         let netplan_to = PathBuf::from(PREP_MOUNT_POINT).join("etc/netplan").join(DEFAULT_NETPLAN_FILENAME);
+        let formnet_install_to = PathBuf::from(PREP_MOUNT_POINT).join(DEFAULT_FORMNET_INSTALL);
+        let formnet_up_to = PathBuf::from(PREP_MOUNT_POINT).join(DEFAULT_FORMNET_UP);
         log::info!("Where to copy netplan config to: {}", netplan_to.display());
 
         mount_partition(
@@ -194,6 +196,16 @@ pub async fn fetch_and_prepare_images() -> Result<(), UtilError> {
         copy_default_netplan(
             &PathBuf::from(
                 netplan_to
+            )
+        )?;
+        copy_default_formnet_up_service(
+            &PathBuf::from(
+                formnet_up_to
+            )
+        )?;
+        copy_default_formnet_invite_service(
+            &PathBuf::from(
+                formnet_install_to
             )
         )?;
         copy_formnet_client(
@@ -313,7 +325,7 @@ ConditionPathExists=!/etc/formnet/state.toml
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/formnet install --default-name -d /etc/formnet/invite.toml
+ExecStart=/usr/local/bin/formnet install --default-name -d /etc/formnet/invite.toml
 ExecStart=/bin/touch /etc/formnet/state.toml
 RemainAfterExit=yes
 StandardOutput=append:/var/log/formnet.log
@@ -359,7 +371,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/formnet up -d --interval 60
+ExecStart=/usr/local/bin/formnet up -d --interval 60
 Restart=always
 RestartSec=5
 StandardOutput=append:/var/log/formnet.log
